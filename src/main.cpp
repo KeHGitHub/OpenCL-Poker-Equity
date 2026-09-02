@@ -29,12 +29,40 @@ struct Options {
     std::uint64_t trials = 1'000'000;
     std::uint64_t seed = 0;
     bool list_devices = false;
+    bool profile = false;
+    std::uint32_t profile_runs = 5;
+    std::uint32_t warmup_runs = 1;
+    bool hand_provided = false;
+    bool board_provided = false;
 };
 
 struct OpenCLDevice {
     cl_platform_id platform = nullptr;
     cl_device_id device = nullptr;
 };
+
+struct OpenCLRuntime {
+    cl_context context = nullptr;
+    cl_command_queue queue = nullptr;
+    cl_program program = nullptr;
+    cl_kernel kernel = nullptr;
+    std::string device_name;
+};
+
+struct SimulationResult {
+    std::uint64_t wins = 0;
+    std::uint64_t ties = 0;
+    std::uint64_t losses = 0;
+    double pot_share_total = 0.0;
+};
+
+struct TimingSummary {
+    double min_ms = 0.0;
+    double mean_ms = 0.0;
+    double max_ms = 0.0;
+};
+
+SimulationResult run_opencl_simulation(OpenCLRuntime& runtime, const Options& options);
 
 std::string cl_error_name(cl_int err) {
     switch (err) {
@@ -197,6 +225,58 @@ OpenCLDevice choose_device() {
     throw std::runtime_error("no OpenCL GPU/default device found");
 }
 
+OpenCLRuntime create_opencl_runtime() {
+    const OpenCLDevice selected = choose_device();
+    OpenCLRuntime runtime;
+    runtime.device_name = device_info_string(selected.device, CL_DEVICE_NAME);
+
+    cl_int err = CL_SUCCESS;
+    runtime.context = clCreateContext(nullptr, 1, &selected.device, nullptr, nullptr, &err);
+    check(err, "clCreateContext");
+
+    runtime.queue = clCreateCommandQueue(runtime.context, selected.device, 0, &err);
+    check(err, "clCreateCommandQueue");
+
+    const std::string source = read_text_file("kernels/equity_kernel.cl");
+    const char* source_ptr = source.c_str();
+    const size_t source_size = source.size();
+    runtime.program = clCreateProgramWithSource(runtime.context, 1, &source_ptr, &source_size, &err);
+    check(err, "clCreateProgramWithSource");
+
+    err = clBuildProgram(runtime.program, 1, &selected.device, "", nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        size_t log_size = 0;
+        clGetProgramBuildInfo(runtime.program, selected.device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+        std::string log(log_size, '\0');
+        clGetProgramBuildInfo(runtime.program, selected.device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+        throw std::runtime_error("OpenCL program build failed:\n" + log);
+    }
+
+    runtime.kernel = clCreateKernel(runtime.program, "simulate_equity", &err);
+    check(err, "clCreateKernel simulate_equity");
+
+    return runtime;
+}
+
+void release_opencl_runtime(OpenCLRuntime& runtime) {
+    if (runtime.kernel != nullptr) {
+        clReleaseKernel(runtime.kernel);
+        runtime.kernel = nullptr;
+    }
+    if (runtime.program != nullptr) {
+        clReleaseProgram(runtime.program);
+        runtime.program = nullptr;
+    }
+    if (runtime.queue != nullptr) {
+        clReleaseCommandQueue(runtime.queue);
+        runtime.queue = nullptr;
+    }
+    if (runtime.context != nullptr) {
+        clReleaseContext(runtime.context);
+        runtime.context = nullptr;
+    }
+}
+
 int parse_rank(char value) {
     const std::string ranks = "23456789TJQKA";
     const char upper = static_cast<char>(std::toupper(static_cast<unsigned char>(value)));
@@ -275,6 +355,7 @@ void print_usage(const char* argv0) {
     std::cerr
         << "Usage:\n"
         << "  " << argv0 << " --hand \"As Ks\" [--board \"Qh Jh 2c\"] [--opponents 1] [--trials 1000000] [--seed 123]\n\n"
+        << "  " << argv0 << " --profile [--hand \"As Ks\"] [--board \"Qh Jh 2c\"] [--profile-runs 5] [--warmup-runs 1]\n\n"
         << "  " << argv0 << " --list-devices\n\n"
         << "Cards use rank+suit notation: ranks 2-9,T,J,Q,K,A and suits c,d,h,s.\n"
         << "Each opponent hand is sampled from the unknown cards.\n";
@@ -294,8 +375,10 @@ Options parse_options(int argc, char** argv) {
 
         if (arg == "--hand" || arg == "-h") {
             options.hand = parse_cards(require_value(arg));
+            options.hand_provided = true;
         } else if (arg == "--board" || arg == "-b") {
             options.board = parse_cards(require_value(arg));
+            options.board_provided = true;
         } else if (arg == "--opponents" || arg == "-o") {
             const auto opponents = parse_u64(require_value(arg), "opponent count");
             if (opponents > kMaxOpponents) {
@@ -306,6 +389,17 @@ Options parse_options(int argc, char** argv) {
             options.trials = parse_u64(require_value(arg), "trial count");
         } else if (arg == "--seed") {
             options.seed = parse_u64(require_value(arg), "seed");
+        } else if (arg == "--profile") {
+            options.profile = true;
+        } else if (arg == "--profile-runs") {
+            const auto runs = parse_u64(require_value(arg), "profile run count");
+            if (runs == 0) {
+                throw std::runtime_error("--profile-runs must be greater than zero");
+            }
+            options.profile_runs = static_cast<std::uint32_t>(runs);
+        } else if (arg == "--warmup-runs") {
+            options.warmup_runs = static_cast<std::uint32_t>(
+                parse_u64(require_value(arg), "warmup run count"));
         } else if (arg == "--list-devices") {
             options.list_devices = true;
         } else if (arg == "--help") {
@@ -320,7 +414,10 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
 
-    if (options.hand.size() != 2) {
+    if (!options.profile && options.hand.size() != 2) {
+        throw std::runtime_error("--hand must contain exactly two cards");
+    }
+    if (options.hand_provided && options.hand.size() != 2) {
         throw std::runtime_error("--hand must contain exactly two cards");
     }
     if (options.board.size() > 5) {
@@ -384,15 +481,12 @@ cl_mem make_buffer(
 
 void print_results(
     const Options& options,
-    std::uint64_t wins,
-    std::uint64_t ties,
-    std::uint64_t losses,
-    double pot_share_total,
+    const SimulationResult& result,
     const std::string& device_name) {
-    const double win_probability = static_cast<double>(wins) / static_cast<double>(options.trials);
-    const double tie_probability = static_cast<double>(ties) / static_cast<double>(options.trials);
-    const double loss_probability = static_cast<double>(losses) / static_cast<double>(options.trials);
-    const double equity = pot_share_total / static_cast<double>(options.trials);
+    const double win_probability = static_cast<double>(result.wins) / static_cast<double>(options.trials);
+    const double tie_probability = static_cast<double>(result.ties) / static_cast<double>(options.trials);
+    const double loss_probability = static_cast<double>(result.losses) / static_cast<double>(options.trials);
+    const double equity = result.pot_share_total / static_cast<double>(options.trials);
 
     std::cout << "Hero hand: " << cards_to_string(options.hand) << '\n';
     std::cout << "Board:     " << cards_to_string(options.board) << '\n';
@@ -410,6 +504,452 @@ void print_results(
     std::cout << "Tie:       " << (tie_probability * 100.0) << "%\n";
     std::cout << "Loss:      " << (loss_probability * 100.0) << "%\n";
     std::cout << "Equity:    " << (equity * 100.0) << "%\n";
+}
+
+SimulationResult reduce_outcomes(
+    const Options& options,
+    const std::vector<unsigned char>& outcomes,
+    const std::vector<unsigned char>& pot_shares) {
+    SimulationResult result;
+    for (unsigned char outcome : outcomes) {
+        if (outcome == 2) {
+            ++result.wins;
+        } else if (outcome == 1) {
+            ++result.ties;
+        }
+    }
+    for (unsigned char share : pot_shares) {
+        if (share > 0) {
+            result.pot_share_total += 1.0 / static_cast<double>(share);
+        }
+    }
+    result.losses = options.trials - result.wins - result.ties;
+    return result;
+}
+
+int straight_high_reference(int rank_mask) {
+    for (int high = 12; high >= 4; --high) {
+        const int needed = 0x1f << (high - 4);
+        if ((rank_mask & needed) == needed) {
+            return high;
+        }
+    }
+
+    if ((rank_mask & ((1 << 12) | 0x0f)) == ((1 << 12) | 0x0f)) {
+        return 3;
+    }
+
+    return -1;
+}
+
+std::uint32_t pack_score_reference(int category, int a, int b, int c, int d, int e) {
+    return (static_cast<std::uint32_t>(category) << 20)
+        | (static_cast<std::uint32_t>(a) << 16)
+        | (static_cast<std::uint32_t>(b) << 12)
+        | (static_cast<std::uint32_t>(c) << 8)
+        | (static_cast<std::uint32_t>(d) << 4)
+        | static_cast<std::uint32_t>(e);
+}
+
+std::uint32_t eval5_reference(
+    unsigned char c0,
+    unsigned char c1,
+    unsigned char c2,
+    unsigned char c3,
+    unsigned char c4) {
+    const std::array<unsigned char, 5> cards = {c0, c1, c2, c3, c4};
+    std::array<int, 13> rank_counts{};
+    std::array<int, 4> suit_counts{};
+    int rank_mask = 0;
+
+    for (unsigned char card : cards) {
+        const int rank = card / 4;
+        const int suit = card % 4;
+        ++rank_counts[rank];
+        ++suit_counts[suit];
+        rank_mask |= 1 << rank;
+    }
+
+    const bool is_flush = std::any_of(suit_counts.begin(), suit_counts.end(), [](int count) {
+        return count == 5;
+    });
+    const int straight = straight_high_reference(rank_mask);
+    if (is_flush && straight >= 0) {
+        return pack_score_reference(8, straight, 0, 0, 0, 0);
+    }
+
+    int quad = -1;
+    int trips = -1;
+    std::array<int, 2> pairs = {-1, -1};
+    int pair_count = 0;
+
+    for (int rank = 12; rank >= 0; --rank) {
+        if (rank_counts[rank] == 4) {
+            quad = rank;
+        } else if (rank_counts[rank] == 3) {
+            trips = rank;
+        } else if (rank_counts[rank] == 2) {
+            pairs[pair_count] = rank;
+            ++pair_count;
+        }
+    }
+
+    if (quad >= 0) {
+        int kicker = 0;
+        for (int rank = 12; rank >= 0; --rank) {
+            if (rank_counts[rank] == 1) {
+                kicker = rank;
+                break;
+            }
+        }
+        return pack_score_reference(7, quad, kicker, 0, 0, 0);
+    }
+
+    if (trips >= 0 && pair_count > 0) {
+        return pack_score_reference(6, trips, pairs[0], 0, 0, 0);
+    }
+
+    if (is_flush) {
+        std::array<int, 5> ranks{};
+        int out = 0;
+        for (int rank = 12; rank >= 0; --rank) {
+            for (int i = 0; i < rank_counts[rank]; ++i) {
+                ranks[out++] = rank;
+            }
+        }
+        return pack_score_reference(5, ranks[0], ranks[1], ranks[2], ranks[3], ranks[4]);
+    }
+
+    if (straight >= 0) {
+        return pack_score_reference(4, straight, 0, 0, 0, 0);
+    }
+
+    if (trips >= 0) {
+        std::array<int, 2> kickers{};
+        int out = 0;
+        for (int rank = 12; rank >= 0; --rank) {
+            if (rank_counts[rank] == 1) {
+                kickers[out++] = rank;
+            }
+        }
+        return pack_score_reference(3, trips, kickers[0], kickers[1], 0, 0);
+    }
+
+    if (pair_count == 2) {
+        int kicker = 0;
+        for (int rank = 12; rank >= 0; --rank) {
+            if (rank_counts[rank] == 1) {
+                kicker = rank;
+                break;
+            }
+        }
+        return pack_score_reference(2, pairs[0], pairs[1], kicker, 0, 0);
+    }
+
+    if (pair_count == 1) {
+        std::array<int, 3> kickers{};
+        int out = 0;
+        for (int rank = 12; rank >= 0; --rank) {
+            if (rank_counts[rank] == 1) {
+                kickers[out++] = rank;
+            }
+        }
+        return pack_score_reference(1, pairs[0], kickers[0], kickers[1], kickers[2], 0);
+    }
+
+    std::array<int, 5> ranks{};
+    int out = 0;
+    for (int rank = 12; rank >= 0; --rank) {
+        if (rank_counts[rank] == 1) {
+            ranks[out++] = rank;
+        }
+    }
+    return pack_score_reference(0, ranks[0], ranks[1], ranks[2], ranks[3], ranks[4]);
+}
+
+std::uint32_t eval7_reference(const std::array<unsigned char, 7>& cards) {
+    std::uint32_t best = 0;
+    for (int a = 0; a < 3; ++a) {
+        for (int b = a + 1; b < 4; ++b) {
+            for (int c = b + 1; c < 5; ++c) {
+                for (int d = c + 1; d < 6; ++d) {
+                    for (int e = d + 1; e < 7; ++e) {
+                        const std::uint32_t score = eval5_reference(
+                            cards[a],
+                            cards[b],
+                            cards[c],
+                            cards[d],
+                            cards[e]);
+                        best = std::max(best, score);
+                    }
+                }
+            }
+        }
+    }
+    return best;
+}
+
+std::uint32_t next_random_reference(std::uint32_t& state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+unsigned char draw_card_reference(std::uint64_t& used, std::uint32_t& state) {
+    while (true) {
+        const auto card = static_cast<unsigned char>(next_random_reference(state) % 52);
+        const std::uint64_t bit = std::uint64_t{1} << card;
+        if ((used & bit) == 0) {
+            used |= bit;
+            return card;
+        }
+    }
+}
+
+void mark_card_reference(std::uint64_t& used, unsigned char card) {
+    used |= std::uint64_t{1} << card;
+}
+
+SimulationResult run_cpu_reference(const Options& options) {
+    SimulationResult result;
+
+    for (std::uint64_t trial = 0; trial < options.trials; ++trial) {
+        std::uint32_t state = static_cast<std::uint32_t>(
+            options.seed ^ (options.seed >> 32) ^ ((trial + 1) * 747796405ull));
+        if (state == 0) {
+            state = 2891336453u;
+        }
+
+        std::uint64_t used = 0;
+        mark_card_reference(used, options.hand[0]);
+        mark_card_reference(used, options.hand[1]);
+
+        std::array<unsigned char, 5> final_board{};
+        for (size_t i = 0; i < options.board.size(); ++i) {
+            final_board[i] = options.board[i];
+            mark_card_reference(used, options.board[i]);
+        }
+
+        std::array<unsigned char, kMaxOpponents * 2> opponents{};
+        for (std::uint32_t i = 0; i < options.opponents; ++i) {
+            opponents[i * 2] = draw_card_reference(used, state);
+            opponents[i * 2 + 1] = draw_card_reference(used, state);
+        }
+
+        for (size_t i = options.board.size(); i < final_board.size(); ++i) {
+            final_board[i] = draw_card_reference(used, state);
+        }
+
+        const std::array<unsigned char, 7> hero_cards = {
+            options.hand[0],
+            options.hand[1],
+            final_board[0],
+            final_board[1],
+            final_board[2],
+            final_board[3],
+            final_board[4],
+        };
+        const std::uint32_t hero_score = eval7_reference(hero_cards);
+
+        std::uint32_t split_count = 1;
+        bool beaten = false;
+        for (std::uint32_t i = 0; i < options.opponents; ++i) {
+            const std::array<unsigned char, 7> villain_cards = {
+                opponents[i * 2],
+                opponents[i * 2 + 1],
+                final_board[0],
+                final_board[1],
+                final_board[2],
+                final_board[3],
+                final_board[4],
+            };
+            const std::uint32_t villain_score = eval7_reference(villain_cards);
+            if (villain_score > hero_score) {
+                beaten = true;
+                break;
+            }
+            if (villain_score == hero_score) {
+                ++split_count;
+            }
+        }
+
+        if (beaten) {
+            ++result.losses;
+        } else if (split_count == 1) {
+            ++result.wins;
+            result.pot_share_total += 1.0;
+        } else {
+            ++result.ties;
+            result.pot_share_total += 1.0 / static_cast<double>(split_count);
+        }
+    }
+
+    return result;
+}
+
+TimingSummary summarize_timings(const std::vector<double>& timings) {
+    TimingSummary summary;
+    if (timings.empty()) {
+        return summary;
+    }
+
+    summary.min_ms = timings.front();
+    summary.max_ms = timings.front();
+    double total = 0.0;
+    for (double timing : timings) {
+        summary.min_ms = std::min(summary.min_ms, timing);
+        summary.max_ms = std::max(summary.max_ms, timing);
+        total += timing;
+    }
+    summary.mean_ms = total / static_cast<double>(timings.size());
+    return summary;
+}
+
+template <typename Fn>
+SimulationResult time_simulation(Fn&& fn, double* elapsed_ms) {
+    const auto start = std::chrono::steady_clock::now();
+    SimulationResult result = fn();
+    const auto end = std::chrono::steady_clock::now();
+    *elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    return result;
+}
+
+double result_equity(const Options& options, const SimulationResult& result) {
+    return result.pot_share_total / static_cast<double>(options.trials);
+}
+
+Options make_profile_scenario(const Options& base, std::uint64_t scenario_seed) {
+    Options scenario = base;
+    scenario.seed = scenario_seed;
+    scenario.list_devices = false;
+    scenario.profile = false;
+
+    std::uint32_t state = static_cast<std::uint32_t>(
+        scenario_seed ^ (scenario_seed >> 32) ^ 0x9e3779b9u);
+    if (state == 0) {
+        state = 2891336453u;
+    }
+
+    std::uint64_t used = 0;
+    if (base.hand_provided) {
+        for (unsigned char card : scenario.hand) {
+            mark_card_reference(used, card);
+        }
+    } else {
+        scenario.hand.clear();
+    }
+
+    if (base.board_provided) {
+        for (unsigned char card : scenario.board) {
+            mark_card_reference(used, card);
+        }
+    } else {
+        scenario.board.clear();
+    }
+
+    while (scenario.hand.size() < 2) {
+        scenario.hand.push_back(draw_card_reference(used, state));
+    }
+
+    if (!base.board_provided) {
+        const std::uint32_t board_count = next_random_reference(state) % 6u;
+        while (scenario.board.size() < board_count) {
+            scenario.board.push_back(draw_card_reference(used, state));
+        }
+    }
+
+    return scenario;
+}
+
+void print_timing_summary(const std::string& name, const TimingSummary& summary) {
+    std::cout << name
+              << " min=" << summary.min_ms << " ms"
+              << " mean=" << summary.mean_ms << " ms"
+              << " max=" << summary.max_ms << " ms\n";
+}
+
+int run_profile(const Options& options) {
+    const auto init_start = std::chrono::steady_clock::now();
+    OpenCLRuntime runtime = create_opencl_runtime();
+    const auto init_end = std::chrono::steady_clock::now();
+    const double opencl_init_ms = std::chrono::duration<double, std::milli>(init_end - init_start).count();
+
+    const std::uint32_t total_runs = options.warmup_runs + options.profile_runs;
+    std::vector<Options> scenarios;
+    scenarios.reserve(total_runs);
+    for (std::uint32_t i = 0; i < total_runs; ++i) {
+        const std::uint64_t scenario_seed = options.seed + (static_cast<std::uint64_t>(i + 1) * 0x9e3779b97f4a7c15ull);
+        scenarios.push_back(make_profile_scenario(options, scenario_seed));
+    }
+
+    for (std::uint32_t i = 0; i < options.warmup_runs; ++i) {
+        (void)run_cpu_reference(scenarios[i]);
+        (void)run_opencl_simulation(runtime, scenarios[i]);
+    }
+
+    std::vector<double> cpu_timings;
+    std::vector<double> opencl_timings;
+    cpu_timings.reserve(options.profile_runs);
+    opencl_timings.reserve(options.profile_runs);
+
+    std::cout << "Profile configuration\n";
+    std::cout << "Trials/run:    " << options.trials << '\n';
+    std::cout << "Opponents:     " << options.opponents << '\n';
+    std::cout << "Warmup runs:   " << options.warmup_runs << '\n';
+    std::cout << "Measured runs: " << options.profile_runs << '\n';
+    std::cout << "Base seed:     " << options.seed << '\n';
+    std::cout << "OpenCL device: " << runtime.device_name << '\n';
+    std::cout << "OpenCL init:   " << opencl_init_ms << " ms\n\n";
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "Run  Hand   Board            CPU ms      OpenCL ms   Speedup   Equity\n";
+
+    for (std::uint32_t i = 0; i < options.profile_runs; ++i) {
+        const Options& scenario = scenarios[options.warmup_runs + i];
+
+        double cpu_ms = 0.0;
+        const SimulationResult cpu_result = time_simulation(
+            [&]() { return run_cpu_reference(scenario); },
+            &cpu_ms);
+
+        double opencl_ms = 0.0;
+        const SimulationResult opencl_result = time_simulation(
+            [&]() { return run_opencl_simulation(runtime, scenario); },
+            &opencl_ms);
+
+        cpu_timings.push_back(cpu_ms);
+        opencl_timings.push_back(opencl_ms);
+
+        const double speedup = opencl_ms > 0.0 ? cpu_ms / opencl_ms : 0.0;
+        std::cout << std::setw(3) << (i + 1) << "  "
+                  << std::setw(5) << cards_to_string(scenario.hand) << "  "
+                  << std::setw(15) << cards_to_string(scenario.board) << "  "
+                  << std::setw(10) << cpu_ms << "  "
+                  << std::setw(10) << opencl_ms << "  "
+                  << std::setw(7) << speedup << "x  "
+                  << std::setw(6) << (result_equity(scenario, opencl_result) * 100.0) << "%\n";
+
+        if (cpu_result.wins != opencl_result.wins
+            || cpu_result.ties != opencl_result.ties
+            || cpu_result.losses != opencl_result.losses
+            || cpu_result.pot_share_total != opencl_result.pot_share_total) {
+            std::cerr << "warning: CPU reference and OpenCL results differed on run " << (i + 1) << '\n';
+        }
+    }
+
+    const TimingSummary cpu_summary = summarize_timings(cpu_timings);
+    const TimingSummary opencl_summary = summarize_timings(opencl_timings);
+
+    std::cout << "\nSummary\n";
+    print_timing_summary("CPU reference:", cpu_summary);
+    print_timing_summary("OpenCL hot:   ", opencl_summary);
+    if (opencl_summary.mean_ms > 0.0) {
+        std::cout << "Mean speedup:  " << (cpu_summary.mean_ms / opencl_summary.mean_ms) << "x\n";
+    }
+
+    release_opencl_runtime(runtime);
+    return 0;
 }
 
 std::string device_type_label(cl_device_type type) {
@@ -509,35 +1049,7 @@ int list_opencl_devices() {
     return 0;
 }
 
-int run_opencl(const Options& options) {
-    const OpenCLDevice selected = choose_device();
-    const std::string device_name = device_info_string(selected.device, CL_DEVICE_NAME);
-
-    cl_int err = CL_SUCCESS;
-    cl_context context = clCreateContext(nullptr, 1, &selected.device, nullptr, nullptr, &err);
-    check(err, "clCreateContext");
-
-    cl_command_queue queue = clCreateCommandQueue(context, selected.device, 0, &err);
-    check(err, "clCreateCommandQueue");
-
-    const std::string source = read_text_file("kernels/equity_kernel.cl");
-    const char* source_ptr = source.c_str();
-    const size_t source_size = source.size();
-    cl_program program = clCreateProgramWithSource(context, 1, &source_ptr, &source_size, &err);
-    check(err, "clCreateProgramWithSource");
-
-    err = clBuildProgram(program, 1, &selected.device, "", nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-        size_t log_size = 0;
-        clGetProgramBuildInfo(program, selected.device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
-        std::string log(log_size, '\0');
-        clGetProgramBuildInfo(program, selected.device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
-        throw std::runtime_error("OpenCL program build failed:\n" + log);
-    }
-
-    cl_kernel kernel = clCreateKernel(program, "simulate_equity", &err);
-    check(err, "clCreateKernel simulate_equity");
-
+SimulationResult run_opencl_simulation(OpenCLRuntime& runtime, const Options& options) {
     std::array<unsigned char, 2> hand = {options.hand[0], options.hand[1]};
     std::array<unsigned char, 5> board = {255, 255, 255, 255, 255};
     std::copy(options.board.begin(), options.board.end(), board.begin());
@@ -546,25 +1058,25 @@ int run_opencl(const Options& options) {
     std::vector<unsigned char> pot_shares(static_cast<size_t>(options.trials));
 
     cl_mem hand_buffer = make_buffer(
-        context,
+        runtime.context,
         CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         hand.size() * sizeof(unsigned char),
         hand.data(),
         "hand");
     cl_mem board_buffer = make_buffer(
-        context,
+        runtime.context,
         CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         board.size() * sizeof(unsigned char),
         board.data(),
         "board");
     cl_mem outcomes_buffer = make_buffer(
-        context,
+        runtime.context,
         CL_MEM_WRITE_ONLY,
         outcomes.size() * sizeof(unsigned char),
         nullptr,
         "outcomes");
     cl_mem pot_shares_buffer = make_buffer(
-        context,
+        runtime.context,
         CL_MEM_WRITE_ONLY,
         pot_shares.size() * sizeof(unsigned char),
         nullptr,
@@ -574,23 +1086,23 @@ int run_opencl(const Options& options) {
     const cl_uint opponent_count = static_cast<cl_uint>(options.opponents);
     const cl_ulong seed = static_cast<cl_ulong>(options.seed);
 
-    check(clSetKernelArg(kernel, 0, sizeof(cl_mem), &hand_buffer), "clSetKernelArg hand");
-    check(clSetKernelArg(kernel, 1, sizeof(cl_mem), &board_buffer), "clSetKernelArg board");
-    check(clSetKernelArg(kernel, 2, sizeof(cl_uint), &board_count), "clSetKernelArg board_count");
-    check(clSetKernelArg(kernel, 3, sizeof(cl_uint), &opponent_count), "clSetKernelArg opponent_count");
-    check(clSetKernelArg(kernel, 4, sizeof(cl_ulong), &seed), "clSetKernelArg seed");
-    check(clSetKernelArg(kernel, 5, sizeof(cl_mem), &outcomes_buffer), "clSetKernelArg outcomes");
-    check(clSetKernelArg(kernel, 6, sizeof(cl_mem), &pot_shares_buffer), "clSetKernelArg pot_shares");
+    check(clSetKernelArg(runtime.kernel, 0, sizeof(cl_mem), &hand_buffer), "clSetKernelArg hand");
+    check(clSetKernelArg(runtime.kernel, 1, sizeof(cl_mem), &board_buffer), "clSetKernelArg board");
+    check(clSetKernelArg(runtime.kernel, 2, sizeof(cl_uint), &board_count), "clSetKernelArg board_count");
+    check(clSetKernelArg(runtime.kernel, 3, sizeof(cl_uint), &opponent_count), "clSetKernelArg opponent_count");
+    check(clSetKernelArg(runtime.kernel, 4, sizeof(cl_ulong), &seed), "clSetKernelArg seed");
+    check(clSetKernelArg(runtime.kernel, 5, sizeof(cl_mem), &outcomes_buffer), "clSetKernelArg outcomes");
+    check(clSetKernelArg(runtime.kernel, 6, sizeof(cl_mem), &pot_shares_buffer), "clSetKernelArg pot_shares");
 
     const size_t global_work_size = outcomes.size();
     check(
-        clEnqueueNDRangeKernel(queue, kernel, 1, nullptr, &global_work_size, nullptr, 0, nullptr, nullptr),
+        clEnqueueNDRangeKernel(runtime.queue, runtime.kernel, 1, nullptr, &global_work_size, nullptr, 0, nullptr, nullptr),
         "clEnqueueNDRangeKernel");
-    check(clFinish(queue), "clFinish");
+    check(clFinish(runtime.queue), "clFinish");
 
     check(
         clEnqueueReadBuffer(
-            queue,
+            runtime.queue,
             outcomes_buffer,
             CL_TRUE,
             0,
@@ -602,7 +1114,7 @@ int run_opencl(const Options& options) {
         "clEnqueueReadBuffer outcomes");
     check(
         clEnqueueReadBuffer(
-            queue,
+            runtime.queue,
             pot_shares_buffer,
             CL_TRUE,
             0,
@@ -613,39 +1125,30 @@ int run_opencl(const Options& options) {
             nullptr),
         "clEnqueueReadBuffer pot_shares");
 
-    std::uint64_t wins = 0;
-    std::uint64_t ties = 0;
-    double pot_share_total = 0.0;
-    for (unsigned char outcome : outcomes) {
-        if (outcome == 2) {
-            ++wins;
-        } else if (outcome == 1) {
-            ++ties;
-        }
-    }
-    for (unsigned char share : pot_shares) {
-        if (share > 0) {
-            pot_share_total += 1.0 / static_cast<double>(share);
-        }
-    }
-    const std::uint64_t losses = options.trials - wins - ties;
-    print_results(options, wins, ties, losses, pot_share_total, device_name);
+    const SimulationResult result = reduce_outcomes(options, outcomes, pot_shares);
 
     clReleaseMemObject(pot_shares_buffer);
     clReleaseMemObject(outcomes_buffer);
     clReleaseMemObject(board_buffer);
     clReleaseMemObject(hand_buffer);
-    clReleaseKernel(kernel);
-    clReleaseProgram(program);
-    clReleaseCommandQueue(queue);
-    clReleaseContext(context);
 
+    return result;
+}
+
+int run_opencl(const Options& options) {
+    OpenCLRuntime runtime = create_opencl_runtime();
+    const SimulationResult result = run_opencl_simulation(runtime, options);
+    print_results(options, result, runtime.device_name);
+    release_opencl_runtime(runtime);
     return 0;
 }
 
 int run(const Options& options) {
     if (options.list_devices) {
         return list_opencl_devices();
+    }
+    if (options.profile) {
+        return run_profile(options);
     }
 
     return run_opencl(options);
