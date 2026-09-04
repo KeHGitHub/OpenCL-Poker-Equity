@@ -16,6 +16,10 @@ target_link_libraries(poker_equity PRIVATE OpenCL::OpenCL)
 
 target_compile_definitions(poker_equity PRIVATE CL_TARGET_OPENCL_VERSION=120)
 
+add_executable(kuhn_cfr
+    src/kuhn_cfr.cpp
+)
+
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/kernels/equity_kernel.cl
     ${CMAKE_CURRENT_BINARY_DIR}/kernels/equity_kernel.cl

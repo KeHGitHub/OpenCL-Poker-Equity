@@ -37,6 +37,17 @@ cmake -S . -B build
 cmake --build build
 ```
 
+## Kuhn Poker CFR Toy
+
+The repo also includes a small standalone Kuhn poker CFR solver and terminal
+game. It trains a strategy with counterfactual regret minimization, prints the
+average strategy, then lets you play as Player 0 against the solver.
+
+```sh
+./build/kuhn_cfr
+./build/kuhn_cfr --iterations 10000
+```
+
 ## Run
 
 ```sh
