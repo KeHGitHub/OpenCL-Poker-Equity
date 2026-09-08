@@ -125,11 +125,18 @@ const char* action_name(const std::string& history, int action) {
     return facing_bet ? "call" : "bet";
 }
 
+
+// Because our value is always written from Player 0's perspective, and Player 1 wants Player 0's payoff low.
 double cfr(State state, double p0, double p1) {
     if (state.terminal()) {
         return state.utility_for_player0();
     }
 
+    // p0 and p1 are reach probabilities: how likely each player's own past
+    // mixed-strategy choices made this state happen. When updating one
+    // player's regret, CFR weights by the opponent's reach probability because
+    // it asks: if I were at this infoset, how often did the opponent's choices
+    // create this situation?
     const int player = state.current_player();
     InfoSet& info = infosets[infoset_key(state)];
     const auto strategy = info.strategy(player == 0 ? p0 : p1);
